@@ -46,6 +46,7 @@ pip("honeybee-energy==1.109.27")
 pip("dragonfly-core==1.57.11")
 pip("lbt-dragonfly")
 pip("honeybee-openstudio")
+pip("setuptools")
 pip("pandas matplotlib plotly requests beautifulsoup4 geopy")
 
 print("Instalando EnergyPlus 23.2.0...")
@@ -297,12 +298,8 @@ def construir_modelo_hb(ancho, largo, altura, sfr, domo_ancho, domo_largo,
     from honeybee_energy.load.ventilation import Ventilation
     from honeybee_energy.schedule.ruleset import ScheduleRuleset
     from honeybee_energy.lib.scheduletypelimits import schedule_type_limit_by_identifier
-    from honeybee_energy.facetype import face_types
-    from honeybee_energy.modifier.modifierbase import ModifierBase
-    from honeybee_energy.construction.opaque import OpaqueConstruction
     from honeybee_energy.construction.window import WindowConstruction
     from honeybee_energy.lib.constructions import opaque_construction_by_identifier
-    from honeybee_energy.lib.constructions import window_construction_by_identifier
 
     # ---- 1. Geometría base (igual que geometry_utils.py) ----
     puntos_piso = [
