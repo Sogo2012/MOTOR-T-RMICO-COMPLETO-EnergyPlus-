@@ -8,11 +8,9 @@ Original file is located at
 
 # -*- coding: utf-8 -*-
 '''
-======================================================================╗
          SKYCALC 2.0 - MOTOR TÉRMICO COMPLETO (EnergyPlus)          
          Eco Consultor | Sunoptics LATAM                             
          Versión: 3.0 | Para Google Colab (T4 GPU / CPU)
-======================================================================╝
 
 ARQUITECTURA:
   1. Instalación de infraestructura (EnergyPlus + LBT)
@@ -29,10 +27,26 @@ El resultado final es la función `simular_nave_sunoptics()` que
 puede ser importada directamente desde motor_termico.py en Streamlit.
 '''
 """
+# ==============================================================
+# SKYCALC 2.0 - MOTOR TERMICO ENERGYPLUS
+# Eco Consultor | Sunoptics LATAM
+#
+# INSTRUCCIONES:
+#   CELDA 1: Ejecutar sola -> esperar ~5 min -> Runtime > Restart session
+#   CELDAS 2-10: Ejecutar en orden. Cada una imprime OK al final.
+#   Si una celda NO imprime OK, hay un error. No continuar.
+# ==============================================================
+
+
+# ##############################################################
+# CELDA 1 - INSTALACION
+# Ejecutar sola. Luego: Runtime > Restart session.
+# NO ejecutar de nuevo despues del restart.
+# ##############################################################
 
 import subprocess, sys, os
 
-def pip(pkg):
+def _pip(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=False)
 
 print("Instalando Ladybug Tools...")
@@ -51,15 +65,47 @@ pip("pandas matplotlib plotly requests beautifulsoup4 geopy")
 
 print("Instalando EnergyPlus 23.2.0...")
 
+print("CELDA 1: Iniciando instalacion...")
+print("  [1/4] pydantic y numpy...")
+_pip("pydantic<2.0")
+_pip("numpy==1.26.4")
+
+print("  [2/4] Ladybug Tools...")
+_pip("ladybug-geometry==1.33.11")
+_pip("ladybug-core==0.43.18")
+_pip("honeybee-core==1.60.0")
+_pip("honeybee-energy==1.109.27")
+_pip("dragonfly-core==1.57.11")
+_pip("lbt-dragonfly")
+_pip("honeybee-openstudio")
+
+print("  [3/4] Librerias de datos y scraping...")
+_pip("pandas matplotlib plotly requests beautifulsoup4 geopy")
+
+print("  [4/4] EnergyPlus 23.2.0...")
 EP_TAR = "EnergyPlus-23.2.0-7636e6b3e9-Linux-Ubuntu22.04-x86_64.tar.gz"
 EP_URL = f"https://github.com/NREL/EnergyPlus/releases/download/v23.2.0/{EP_TAR}"
 EP_DIR = EP_TAR.replace(".tar.gz", "")
-
 if not os.path.exists("/usr/local/energyplus"):
+    print("  Descargando EnergyPlus (~100MB)...")
     os.system(f"wget -q {EP_URL}")
     os.system(f"tar -xzf {EP_TAR}")
     os.system(f"sudo cp -r {EP_DIR}/. /usr/local/")
     os.system("sudo ln -sf /usr/local/energyplus /usr/local/bin/energyplus 2>/dev/null || true")
+else:
+    print("  EnergyPlus ya instalado.")
+
+r = subprocess.run(["energyplus", "--version"], capture_output=True, text=True)
+ep_ok = "EnergyPlus" in r.stdout
+print(f"  EnergyPlus: {'OK - ' + r.stdout.strip() if ep_ok else 'NO ENCONTRADO'}")
+
+print("")
+print("=" * 60)
+print("CELDA 1 COMPLETA.")
+print(">>> SIGUIENTE PASO: Runtime > Restart session <<<")
+print("Luego ejecutar celdas 2 a 10 en orden.")
+print("=" * 60)
+
 
 result = subprocess.run(["energyplus", "--version"], capture_output=True, text=True)
 if "EnergyPlus" in result.stdout:
@@ -82,13 +128,20 @@ import tempfile
 import urllib.request
 import zipfile
 import warnings
+# ##############################################################
+# CELDA 2 - IMPORTACIONES GLOBALES
+# ##############################################################
+
+import os, sys, math, json, sqlite3, shutil
+import tempfile, urllib.request, zipfile
+import warnings, subprocess, re, time, random
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-# Ladybug / Honeybee
+# Ladybug / Honeybee / Dragonfly
 from ladybug_geometry.geometry3d.pointvector import Point3D
 from ladybug_geometry.geometry3d.face import Face3D
 from dragonfly.model import Model as DFModel
@@ -290,6 +343,182 @@ def construir_modelo_hb(ancho, largo, altura, sfr, domo_ancho, domo_largo,
     NOTA: Esta función es una versión extendida de geometry_utils.py de Streamlit.
     Agrega las propiedades energéticas que faltaban para EnergyPlus.
     """
+print("=" * 60)
+print("CELDA 2 OK - Importaciones exitosas.")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 3 - PARAMETROS DEL PROYECTO (editar aqui)
+# ##############################################################
+
+# Geometria de la nave
+ANCHO  = 50.0    # metros
+LARGO  = 100.0   # metros
+ALTURA = 8.0     # metros
+
+# Domo Sunoptics modelo 4080 DGZ
+DOMO_VLT   = 0.67    # Visible Light Transmittance
+DOMO_SHGC  = 0.48    # Solar Heat Gain Coefficient
+DOMO_U     = 3.20    # W/(m2 K)
+DOMO_ANCHO = 1.3279  # metros
+DOMO_LARGO = 2.5465  # metros
+
+# Curva SFR: simular del 1% al 10%
+SFR_VALORES = np.arange(0.01, 0.11, 0.01)
+
+# Tipo de uso: "warehouse" | "manufacturing" | "office"
+TIPO_USO = "warehouse"
+
+# HVAC
+COP_COOLING = 3.5
+EFF_HEATING = 0.85
+
+# Coordenadas del proyecto (Queretaro por defecto)
+LAT = 20.5888
+LON = -100.3899
+
+print("=" * 60)
+print("CELDA 3 OK - Parametros cargados:")
+print(f"  Nave    : {ANCHO}m x {LARGO}m x {ALTURA}m")
+print(f"  Domo    : VLT={DOMO_VLT} | SHGC={DOMO_SHGC} | U={DOMO_U} W/m2K")
+print(f"  Uso     : {TIPO_USO}")
+print(f"  HVAC    : COP cooling={COP_COOLING} | Eff heating={EFF_HEATING}")
+print(f"  Coords  : lat={LAT} lon={LON}")
+print(f"  SFR     : {[round(s*100) for s in SFR_VALORES]}%")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 4 - DESCARGA EPW
+# ##############################################################
+
+def descargar_epw_onebuilding(lat, lon, carpeta_destino="/content"):
+    """Descarga el EPW mas cercano. Autosuficiente: imports internos."""
+    import os, math, shutil, urllib.request, zipfile, re, time, random
+    import requests
+    from bs4 import BeautifulSoup
+    from geopy.geocoders import Photon
+
+    print(f"  Buscando EPW para ({lat:.3f}, {lon:.3f})...")
+
+    try:
+        geo = Photon(user_agent="skycalc_v4")
+        loc = geo.reverse(f"{lat}, {lon}", timeout=10)
+        pais_raw = loc.raw.get("properties", {}).get("country", "Mexico")
+    except Exception:
+        pais_raw = "Mexico"
+    print(f"  Pais detectado: {pais_raw}")
+
+    MAPEO = {
+        "mexico":        "https://climate.onebuilding.org/WMO_Region_4_North_and_Central_America/MEX_Mexico/",
+        "costa rica":    "https://climate.onebuilding.org/WMO_Region_4_North_and_Central_America/CRI_Costa_Rica/",
+        "colombia":      "https://climate.onebuilding.org/WMO_Region_3_South_America/COL_Colombia/",
+        "united states": "https://climate.onebuilding.org/WMO_Region_4_North_and_Central_America/USA_United_States_of_America/",
+        "spain":         "https://climate.onebuilding.org/WMO_Region_6_Europe/ESP_Spain/",
+        "chile":         "https://climate.onebuilding.org/WMO_Region_3_South_America/CHL_Chile/",
+        "brazil":        "https://climate.onebuilding.org/WMO_Region_3_South_America/BRA_Brazil/",
+        "argentina":     "https://climate.onebuilding.org/WMO_Region_3_South_America/ARG_Argentina/",
+        "peru":          "https://climate.onebuilding.org/WMO_Region_3_South_America/PER_Peru/",
+    }
+    url_base = next((v for k, v in MAPEO.items() if k in pais_raw.lower()), MAPEO["mexico"])
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp  = requests.get(url_base, headers=headers, timeout=20)
+    soup  = BeautifulSoup(resp.text, "html.parser")
+    links = [a["href"] for a in soup.find_all("a", href=True)
+             if a["href"].endswith(".zip") and "TMYx" in a["href"]]
+    if not links:
+        raise RuntimeError("No se encontraron archivos TMYx.")
+    print(f"  {len(links)} estaciones encontradas. Calculando distancias...")
+
+    def haversine(la1, lo1, la2, lo2):
+        R = 6371
+        dla = math.radians(la2 - la1); dlo = math.radians(lo2 - lo1)
+        a = math.sin(dla/2)**2 + math.cos(math.radians(la1)) * math.cos(math.radians(la2)) * math.sin(dlo/2)**2
+        return R * 2 * math.asin(math.sqrt(a))
+
+    geo2 = Photon(user_agent=f"skycalc_{random.randint(100,999)}")
+    mejor_url, mejor_dist = None, float("inf")
+    for href in links[:20]:
+        try:
+            fname  = href.split("/")[-1].replace(".zip", "")
+            ciudad = re.sub(r"_TMYx.*", "", fname)
+            ciudad = "_".join(ciudad.split("_")[2:]).replace("_", " ").replace(".", " ")
+            gloc   = geo2.geocode(f"{ciudad}, {pais_raw}", timeout=5)
+            if gloc:
+                d = haversine(lat, lon, gloc.latitude, gloc.longitude)
+                if d < mejor_dist:
+                    mejor_dist = d
+                    mejor_url  = (url_base + href) if not href.startswith("http") else href
+            time.sleep(0.3)
+        except Exception:
+            continue
+
+    if not mejor_url:
+        mejor_url  = (url_base + links[0]) if not links[0].startswith("http") else links[0]
+        mejor_dist = 9999
+
+    print(f"  Estacion seleccionada ({mejor_dist:.0f} km): {mejor_url.split('/')[-1]}")
+
+    zip_path = os.path.join(carpeta_destino, "clima_epw.zip")
+    req = urllib.request.Request(mejor_url, headers=headers)
+    with urllib.request.urlopen(req) as r:
+        with open(zip_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+
+    epw_path = None
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(carpeta_destino)
+        for fname in z.namelist():
+            if fname.endswith(".epw"):
+                epw_path = os.path.join(carpeta_destino, fname)
+                break
+
+    if not epw_path:
+        raise RuntimeError("No se encontro .epw en el ZIP.")
+    return epw_path
+
+
+# --- Ejecutar descarga ---
+print("CELDA 4: Descargando EPW...")
+try:
+    epw_path = descargar_epw_onebuilding(lat=LAT, lon=LON)
+    print("=" * 60)
+    print(f"CELDA 4 OK - EPW listo:")
+    print(f"  {epw_path}")
+    print("=" * 60)
+except Exception as _e4:
+    print(f"  AVISO: Fallo descarga automatica ({_e4})")
+    print("  Usando EPW de Chicago para pruebas...")
+    _url_fb = "https://raw.githubusercontent.com/ladybug-tools/ladybug/master/tests/epw/chicago.epw"
+    epw_path = "/content/chicago_test.epw"
+    urllib.request.urlretrieve(_url_fb, epw_path)
+    print("=" * 60)
+    print(f"CELDA 4 OK (fallback) - EPW listo:")
+    print(f"  {epw_path}")
+    print("=" * 60)
+
+
+# ##############################################################
+# CELDA 5 - CONSTRUCTOR DEL MODELO HONEYBEE
+# ##############################################################
+
+def construir_modelo_hb(ancho, largo, altura, sfr,
+                         domo_ancho, domo_largo,
+                         tipo_uso="warehouse",
+                         domo_vlt=0.67, domo_shgc=0.48, domo_u=3.2,
+                         identifier_sufijo=""):
+    """Construye modelo Honeybee con ASHRAE. Autosuficiente: imports internos."""
+    import os, math
+    from ladybug_geometry.geometry3d.pointvector import Point3D
+    from ladybug_geometry.geometry3d.face import Face3D
+    from dragonfly.model import Model as DFModel
+    from dragonfly.building import Building
+    from dragonfly.story import Story
+    from dragonfly.room2d import Room2D
+    from honeybee.aperture import Aperture
+    from honeybee.boundarycondition import Outdoors
     from honeybee_energy.programtype import ProgramType
     from honeybee_energy.load.lighting import Lighting
     from honeybee_energy.load.equipment import ElectricEquipment
@@ -462,6 +691,89 @@ def construir_modelo_hb(ancho, largo, altura, sfr, domo_ancho, domo_largo,
 
     # ---- 5. Construcciones de la Envolvente ----
     # Usamos las construcciones genéricas de Honeybee que ya existen en requirements.txt
+    from honeybee_energy.simulation.parameter import SimulationParameter
+    from honeybee_energy.simulation.output import SimulationOutput
+
+    # 1. Geometria
+    pts = [Point3D(0,0,0), Point3D(ancho,0,0),
+           Point3D(ancho,largo,0), Point3D(0,largo,0)]
+    room_df  = Room2D(f"Nave_{identifier_sufijo}", Face3D(pts),
+                      floor_to_ceiling_height=altura)
+    story    = Story("Nivel_0", room_2ds=[room_df])
+    building = Building("Planta_Industrial", unique_stories=[story])
+    hb_model = DFModel("Modelo_Nave", buildings=[building]).to_honeybee(
+                   object_per_model="Building")[0]
+    hb_room  = hb_model.rooms[0]
+
+    # 2. Domos en el techo
+    techo = [f for f in hb_room.faces if f.type.name == "RoofCeiling"][0]
+    techo.boundary_condition = Outdoors()
+    area_domo = domo_ancho * domo_largo
+    area_piso = ancho * largo
+    num_domos = max(1, math.ceil((area_piso * sfr) / area_domo))
+    cols  = max(1, round((num_domos * (ancho / largo)) ** 0.5))
+    filas = max(1, math.ceil(num_domos / cols))
+    dx, dy = ancho / cols, largo / filas
+    cnt = 1
+    for i in range(cols):
+        for j in range(filas):
+            cx, cy = (i * dx) + dx/2, (j * dy) + dy/2
+            techo.add_aperture(Aperture(
+                f"Domo_{cnt}_{identifier_sufijo}",
+                Face3D([Point3D(cx-domo_ancho/2, cy-domo_largo/2, altura),
+                        Point3D(cx+domo_ancho/2, cy-domo_largo/2, altura),
+                        Point3D(cx+domo_ancho/2, cy+domo_largo/2, altura),
+                        Point3D(cx-domo_ancho/2, cy+domo_largo/2, altura)])))
+            cnt += 1
+    sfr_real = ((cnt - 1) * area_domo) / area_piso
+
+    # 3. Cargas ASHRAE 90.1
+    PERFILES = {
+        "warehouse":     {"lpd": 6.5,  "eq": 4.0,  "m2p": 100.0, "inf": 0.0003, "vent": 0.3},
+        "manufacturing": {"lpd": 12.0, "eq": 20.0, "m2p": 30.0,  "inf": 0.0003, "vent": 0.6},
+        "office":        {"lpd": 10.8, "eq": 10.0, "m2p": 10.0,  "inf": 0.0002, "vent": 0.6},
+    }
+    p = PERFILES.get(tipo_uso, PERFILES["warehouse"])
+
+    try:
+        frac = schedule_type_limit_by_identifier("Fractional")
+        s_on = ScheduleRuleset.from_constant_value(f"On_{identifier_sufijo}",  1.0, frac)
+    except Exception:
+        s_on = ScheduleRuleset.from_constant_value(f"On_{identifier_sufijo}",  1.0)
+
+    prog = ProgramType(f"Prog_{tipo_uso}_{identifier_sufijo}")
+    prog.lighting = Lighting(
+        f"Luz_{identifier_sufijo}", p["lpd"], s_on,
+        radiant_fraction=0.32, visible_fraction=0.25, return_air_fraction=0.0)
+    prog.electric_equipment = ElectricEquipment(
+        f"Eq_{identifier_sufijo}", p["eq"], s_on,
+        radiant_fraction=0.5, latent_fraction=0.0, lost_fraction=0.1)
+    try:
+        s_act = ScheduleRuleset.from_constant_value(f"Act_{identifier_sufijo}", 120.0)
+    except Exception:
+        s_act = s_on
+    prog.people = People(
+        f"Ppl_{identifier_sufijo}", 1.0/p["m2p"], s_on, activity_schedule=s_act)
+    prog.infiltration = Infiltration(
+        f"Inf_{identifier_sufijo}", p["inf"], s_on)
+    prog.ventilation = Ventilation(
+        f"Vent_{identifier_sufijo}", flow_per_area=p["vent"]/1000.0, flow_per_person=0.0)
+    hb_room.properties.energy.program_type = prog
+
+    # 4. HVAC Ideal Air Loads
+    try:
+        from honeybee_energy.hvac.idealair import IdealAirSystem
+        hvac = IdealAirSystem(
+            identifier=f"HVAC_{identifier_sufijo}",
+            economizer_type="DifferentialDryBulb",
+            demand_controlled_ventilation=False,
+            sensible_heat_recovery=0.0, latent_heat_recovery=0.0,
+            heating_limit=None, cooling_limit=None)
+        hb_room.properties.energy.hvac = hvac
+    except Exception as e:
+        print(f"    AVISO HVAC: {e}")
+
+    # 5. Material del domo
     try:
         # Techo: Membrana con aislamiento (R-10 aprox.)
         techo_constr = opaque_construction_by_identifier("Generic Roof Membrane")
@@ -516,11 +828,59 @@ def ejecutar_simulacion_ep(hb_model, epw_path, sim_params, carpeta_salida, nombr
     Retorna la ruta del archivo .sql con los resultados.
     """
     import json
+        mat = EnergyWindowMaterialSimpleGlazSys(
+            f"Mat_{identifier_sufijo}", u_factor=domo_u, shgc=domo_shgc, vt=domo_vlt)
+        constr = WindowConstruction(f"Win_{identifier_sufijo}", [mat])
+        for ap in techo.apertures:
+            ap.properties.energy.construction = constr
+    except Exception as e:
+        print(f"    AVISO material domo: {e}")
+
+    # 6. Outputs de simulacion
+    sim_params = SimulationParameter()
+    sim_params.output = SimulationOutput(
+        include_sqlite=True, include_html=False,
+        outputs=["Zone Ideal Loads Cooling Energy",
+                 "Zone Ideal Loads Heating Energy",
+                 "Zone Lights Electricity Energy"],
+        reporting_frequency="Hourly")
+
+    return hb_model, sfr_real, sim_params
+
+
+# --- Test de la funcion ---
+print("CELDA 5: Probando construir_modelo_hb (SFR=4%)...")
+try:
+    _m, _sfr_r, _ = construir_modelo_hb(
+        ANCHO, LARGO, ALTURA, 0.04,
+        DOMO_ANCHO, DOMO_LARGO, TIPO_USO,
+        DOMO_VLT, DOMO_SHGC, DOMO_U, "test")
+    print(f"  Habitaciones: {len(_m.rooms)}")
+    print(f"  SFR real    : {_sfr_r*100:.2f}%")
+    print(f"  Area domos  : {_sfr_r * ANCHO * LARGO:.1f} m2")
+    del _m
+    print("=" * 60)
+    print("CELDA 5 OK - construir_modelo_hb() funciona.")
+    print("=" * 60)
+except Exception as e:
+    print(f"CELDA 5 ERROR: {e}")
+    raise
+
+
+# ##############################################################
+# CELDA 6 - SIMULACION CON ENERGYPLUS
+# ##############################################################
+
+def ejecutar_simulacion_ep(hb_model, epw_path, sim_params,
+                            carpeta_salida, nombre="caso"):
+    """Traduce a IDF y corre EnergyPlus. Autosuficiente: imports internos."""
+    import os, json, subprocess
 
     carpeta_caso = os.path.join(carpeta_salida, nombre)
     os.makedirs(carpeta_caso, exist_ok=True)
 
     # 1. Guardar .hbjson
+    # Guardar hbjson
     hbjson_path = os.path.join(carpeta_caso, "modelo.hbjson")
     with open(hbjson_path, "w") as f:
         json.dump(hb_model.to_dict(), f)
@@ -584,6 +944,49 @@ def ejecutar_simulacion_ep(hb_model, epw_path, sim_params, carpeta_salida, nombr
             for f in files:
                 if f == "eplusout.sql":
                     sql_path = os.path.join(root, f)
+    # Guardar sim_params
+    sp_path = os.path.join(carpeta_caso, "sim_params.json")
+    with open(sp_path, "w") as f:
+        json.dump(sim_params.to_dict(), f)
+
+    # Traducir a IDF
+    idf_path = os.path.join(carpeta_caso, "modelo.idf")
+    r_tr = subprocess.run(
+        ["honeybee-energy", "translate", "model-to-idf",
+         hbjson_path, "--output-file", idf_path, "--sim-par-json", sp_path],
+        capture_output=True, text=True)
+
+    if not os.path.exists(idf_path):
+        try:
+            from honeybee_energy.run import to_idf
+            idf_path = to_idf(hbjson_path, sim_par_json=sp_path, folder=carpeta_caso)
+            print(f"    IDF via Python API: OK")
+        except Exception as e:
+            raise RuntimeError(
+                f"Fallo IDF.\nCLI: {r_tr.stderr[-500:]}\nAPI: {e}")
+    else:
+        print(f"    IDF via CLI: OK ({os.path.basename(idf_path)})")
+
+    # Detectar EnergyPlus
+    ep = "energyplus"
+    for ruta in ["/usr/local/energyplus", "/usr/local/bin/energyplus"]:
+        if os.path.exists(ruta):
+            ep = ruta
+            break
+
+    # Ejecutar
+    print(f"    Corriendo EnergyPlus para '{nombre}'...")
+    r_sim = subprocess.run(
+        [ep, "-w", epw_path, "-d", carpeta_caso, idf_path],
+        capture_output=True, text=True, timeout=300)
+
+    # Buscar .sql
+    sql_path = os.path.join(carpeta_caso, "eplusout.sql")
+    if not os.path.exists(sql_path):
+        for root, _, files in os.walk(carpeta_caso):
+            for fn in files:
+                if fn == "eplusout.sql":
+                    sql_path = os.path.join(root, fn)
                     break
 
     if not os.path.exists(sql_path):
@@ -714,6 +1117,88 @@ def simular_curva_sfr(
     Compatibilidad: La salida de esta función alimenta directamente
     tab_analitica en app.py de Streamlit.
     """
+            f"EnergyPlus no genero .sql para '{nombre}'.\n"
+            f"STDERR (ultimas 800 chars): {r_sim.stderr[-800:]}")
+
+    kb = os.path.getsize(sql_path) / 1024
+    print(f"    SQL generado: {kb:.0f} KB")
+    return sql_path
+
+
+# --- Verificar CLIs ---
+print("CELDA 6: Verificando CLIs...")
+import subprocess as _sp
+_r1 = _sp.run(["energyplus", "--version"], capture_output=True, text=True)
+_r2 = _sp.run(["honeybee-energy", "--help"], capture_output=True, text=True)
+_ep_ok  = "EnergyPlus" in _r1.stdout
+_hbe_ok = _r2.returncode == 0
+print(f"  EnergyPlus      : {'OK' if _ep_ok  else 'NO ENCONTRADO -> re-ejecutar celda 1 + Restart'}")
+print(f"  honeybee-energy : {'OK' if _hbe_ok else 'NO ENCONTRADO -> re-ejecutar celda 1 + Restart'}")
+print("=" * 60)
+if _ep_ok and _hbe_ok:
+    print("CELDA 6 OK - ejecutar_simulacion_ep() lista.")
+else:
+    print("CELDA 6 ADVERTENCIA - CLIs no disponibles.")
+    print("La simulacion fallara en celda 9.")
+    print("Solucion: re-ejecutar celda 1, Runtime > Restart session.")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 7 - EXTRACCION DE RESULTADOS SQL
+# ##############################################################
+
+def extraer_resultados_sql(sql_path):
+    """Lee .sql de EnergyPlus. Autosuficiente: imports internos."""
+    import sqlite3
+    import numpy as np
+    import pandas as pd
+
+    conn   = sqlite3.connect(sql_path)
+    df_dic = pd.read_sql_query(
+        "SELECT ReportDataDictionaryIndex, Name FROM ReportDataDictionary", conn)
+
+    def kwh_anual(nombre):
+        rows = df_dic[df_dic["Name"].str.contains(nombre, case=False, na=False)]
+        if rows.empty:
+            return 0.0
+        idxs = ",".join(map(str, rows["ReportDataDictionaryIndex"].tolist()))
+        res  = pd.read_sql_query(
+            f"SELECT SUM(Value) as T FROM ReportData "
+            f"WHERE ReportDataDictionaryIndex IN ({idxs})", conn)
+        return float(res["T"].iloc[0] or 0.0) / 3_600_000.0  # J a kWh
+
+    luz     = kwh_anual("Lights Electricity Energy")
+    cooling = kwh_anual("Ideal Loads Cooling Energy")
+    heating = kwh_anual("Ideal Loads Heating Energy")
+    conn.close()
+
+    return {"kwh_iluminacion": luz,
+            "kwh_cooling_demand": cooling,
+            "kwh_heating_demand": heating}
+
+
+print("=" * 60)
+print("CELDA 7 OK - extraer_resultados_sql() lista.")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 8 - MOTOR PRINCIPAL: CURVA SFR SPLIT-FLUX
+# ##############################################################
+
+def simular_curva_sfr(
+    ancho, largo, altura, epw_path,
+    sfr_valores=None, tipo_uso="warehouse",
+    domo_vlt=0.67, domo_shgc=0.48, domo_u=3.2,
+    domo_ancho=1.3279, domo_largo=2.5465,
+    cop_cooling=3.5, eff_heating=0.85,
+    carpeta_salida="/content/simulaciones_sfr"):
+    """Motor principal Split-Flux. Autosuficiente: imports internos."""
+    import os, math
+    import numpy as np
+    import pandas as pd
+
     if sfr_valores is None:
         sfr_valores = np.arange(0.01, 0.11, 0.01)
 
@@ -763,6 +1248,37 @@ def simular_curva_sfr(
 
         try:
             modelo_sfr, sfr_real, params_sfr = construir_modelo_hb(
+    # CASO BASE (sin domos: VLT y SHGC casi cero)
+    print("\n" + "=" * 60)
+    print("CASO BASE (sin luz natural)...")
+    print("=" * 60)
+    m_base, _, p_base = construir_modelo_hb(
+        ancho, largo, altura, sfr=0.001,
+        domo_ancho=domo_ancho, domo_largo=domo_largo,
+        tipo_uso=tipo_uso, domo_vlt=0.001, domo_shgc=0.001,
+        domo_u=domo_u, identifier_sufijo="base")
+
+    sql_base = ejecutar_simulacion_ep(
+        m_base, epw_path, p_base, carpeta_salida, nombre="caso_base")
+    r_base = extraer_resultados_sql(sql_base)
+
+    kwh_luz_b  = r_base["kwh_iluminacion"]
+    kwh_cool_b = r_base["kwh_cooling_demand"] / cop_cooling
+    kwh_heat_b = r_base["kwh_heating_demand"] / eff_heating
+
+    print(f"  Iluminacion base : {kwh_luz_b:,.0f} kWh/anio")
+    print(f"  Cooling base     : {kwh_cool_b:,.0f} kWh/anio")
+    print(f"  Heating base     : {kwh_heat_b:,.0f} kWh/anio")
+    print(f"  TOTAL base       : {kwh_luz_b+kwh_cool_b+kwh_heat_b:,.0f} kWh/anio")
+
+    # CASOS SFR
+    filas = []
+    total = len(sfr_valores)
+    for idx, sfr in enumerate(sfr_valores, 1):
+        sfr_pct = sfr * 100
+        print(f"\n[{idx}/{total}] SFR = {sfr_pct:.0f}%...")
+        try:
+            m_sfr, sfr_real, p_sfr = construir_modelo_hb(
                 ancho, largo, altura, sfr,
                 domo_ancho=domo_ancho, domo_largo=domo_largo,
                 tipo_uso=tipo_uso,
@@ -908,6 +1424,90 @@ def graficar_curva_optimizacion(df_resultados):
         )]
     )
 
+                identifier_sufijo=f"sfr{sfr_pct:.0f}")
+
+            sql_sfr = ejecutar_simulacion_ep(
+                m_sfr, epw_path, p_sfr,
+                carpeta_salida, nombre=f"caso_sfr_{sfr_pct:.0f}pct")
+            r = extraer_resultados_sql(sql_sfr)
+
+            kwh_luz_s  = r["kwh_iluminacion"]
+            kwh_cool_s = r["kwh_cooling_demand"] / cop_cooling
+            kwh_heat_s = r["kwh_heating_demand"] / eff_heating
+
+            # Split-Flux: Savings = Base - Design
+            a_luz   = kwh_luz_b  - kwh_luz_s    # positivo = ahorro
+            p_cool  = kwh_cool_s - kwh_cool_b   # positivo = penalizacion
+            a_heat  = kwh_heat_b - kwh_heat_s   # positivo = ahorro
+            a_neto  = a_luz - p_cool + a_heat
+
+            filas.append({
+                "sfr_pct":               sfr_pct,
+                "sfr_real_pct":          sfr_real * 100,
+                "num_domos":             math.ceil((ancho*largo*sfr)/(domo_ancho*domo_largo)),
+                "kwh_luz_base":          kwh_luz_b,
+                "kwh_luz_sfr":           kwh_luz_s,
+                "kwh_cooling_base":      kwh_cool_b,
+                "kwh_cooling_sfr":       kwh_cool_s,
+                "kwh_heating_base":      kwh_heat_b,
+                "kwh_heating_sfr":       kwh_heat_s,
+                "ahorro_luz_kwh":        a_luz,
+                "penalizacion_cool_kwh": p_cool,
+                "ahorro_heat_kwh":       a_heat,
+                "ahorro_neto_kwh":       a_neto,
+            })
+            print(f"  Ahorro luz    : {a_luz:+,.0f} kWh/anio")
+            print(f"  Penaliz. AC   : {p_cool:+,.0f} kWh/anio")
+            print(f"  Ahorro heat   : {a_heat:+,.0f} kWh/anio")
+            print(f"  AHORRO NETO   : {a_neto:+,.0f} kWh/anio  <---")
+
+        except Exception as e:
+            print(f"  ERROR en SFR {sfr_pct:.0f}%: {e}")
+            continue
+
+    return pd.DataFrame(filas), r_base
+
+
+print("=" * 60)
+print("CELDA 8 OK - simular_curva_sfr() lista.")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 9 - VISUALIZACION
+# ##############################################################
+
+def graficar_curva_optimizacion(df):
+    """Grafica Split-Flux con Plotly."""
+    import plotly.graph_objects as go
+    if df is None or df.empty:
+        print("ERROR: DataFrame vacio.")
+        return None
+
+    sfr_opt = df.loc[df["ahorro_neto_kwh"].idxmax(), "sfr_pct"]
+    a_max   = df["ahorro_neto_kwh"].max()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["sfr_pct"], y=df["ahorro_luz_kwh"],
+        name="Ahorro Iluminacion",
+        line=dict(color="#3498DB", width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=df["sfr_pct"], y=-df["penalizacion_cool_kwh"],
+        name="Penalizacion AC",
+        line=dict(color="#E74C3C", width=2)))
+    fig.add_trace(go.Scatter(x=df["sfr_pct"], y=df["ahorro_heat_kwh"],
+        name="Ahorro Calefaccion",
+        line=dict(color="#F39C12", width=2, dash="dot")))
+    fig.add_trace(go.Scatter(x=df["sfr_pct"], y=df["ahorro_neto_kwh"],
+        name="AHORRO NETO",
+        line=dict(color="#2ECC71", width=4),
+        fill="tozeroy", fillcolor="rgba(46,204,113,0.1)"))
+    fig.add_vline(x=sfr_opt, line_width=2, line_dash="solid", line_color="#8E44AD",
+        annotation_text=f"SFR Optimo: {sfr_opt:.0f}% | Max: {a_max:,.0f} kWh/anio",
+        annotation_position="top right", annotation_font_color="#8E44AD")
+    fig.update_layout(
+        title="Curva de Optimizacion Sunoptics (Motor EnergyPlus)",
+        xaxis_title="SFR (%)", yaxis_title="kWh/anio",
+        hovermode="x unified", template="plotly_white", height=500)
     fig.show()
     return fig
 
@@ -1100,3 +1700,116 @@ df = main()
 if df is not None:
     print(df[["sfr_pct", "ahorro_luz_kwh", "penalizacion_cool_kwh",
               "ahorro_heat_kwh", "ahorro_neto_kwh"]].to_string(index=False))
+def graficar_tabla_resultados(df):
+    """Tabla interactiva de resultados."""
+    import plotly.graph_objects as go
+    if df is None or df.empty:
+        return None
+    fig = go.Figure(data=[go.Table(
+        header=dict(
+            values=["SFR %", "Domos", "Ahorro Luz", "Penaliz. AC",
+                    "Ahorro Heat", "AHORRO NETO"],
+            fill_color="#2C3E50", font=dict(color="white", size=12), align="center"),
+        cells=dict(
+            values=[
+                df["sfr_pct"].apply(lambda x: f"{x:.0f}%"),
+                df["num_domos"].astype(int),
+                df["ahorro_luz_kwh"].apply(lambda x: f"{x:,.0f} kWh"),
+                df["penalizacion_cool_kwh"].apply(lambda x: f"{x:,.0f} kWh"),
+                df["ahorro_heat_kwh"].apply(lambda x: f"{x:,.0f} kWh"),
+                df["ahorro_neto_kwh"].apply(lambda x: f"{x:,.0f} kWh"),
+            ],
+            fill_color=[["#ECF0F1", "#FDFEFE"] * 10],
+            font=dict(size=11), align="center"))])
+    fig.update_layout(title="Resultados Split-Flux por SFR", height=420)
+    fig.show()
+    return fig
+
+
+print("=" * 60)
+print("CELDA 9 OK - funciones de graficacion listas.")
+print("=" * 60)
+
+
+# ##############################################################
+# CELDA 10 - EJECUCION PRINCIPAL
+# Aqui es donde EnergyPlus realmente corre. Tarda ~15-30 min.
+# ##############################################################
+
+import os as _os
+print("CELDA 10: Iniciando motor termico...")
+print("=" * 60)
+
+# Verificar EPW
+if not _os.path.exists(epw_path):
+    print(f"ERROR: EPW no encontrado en {epw_path}")
+    print("Volver a ejecutar celda 4.")
+else:
+    print(f"EPW     : {epw_path}")
+    print(f"Nave    : {ANCHO}m x {LARGO}m x {ALTURA}m | {TIPO_USO}")
+    print(f"Casos   : {len(SFR_VALORES)} SFR + 1 caso base = {len(SFR_VALORES)+1} simulaciones")
+    print(f"Tiempo estimado: ~{(len(SFR_VALORES)+1) * 2}-{(len(SFR_VALORES)+1) * 4} min")
+    print("=" * 60)
+
+    try:
+        df_resultados, resultados_base = simular_curva_sfr(
+            ancho=ANCHO, largo=LARGO, altura=ALTURA,
+            epw_path=epw_path,
+            sfr_valores=SFR_VALORES,
+            tipo_uso=TIPO_USO,
+            domo_vlt=DOMO_VLT, domo_shgc=DOMO_SHGC, domo_u=DOMO_U,
+            domo_ancho=DOMO_ANCHO, domo_largo=DOMO_LARGO,
+            cop_cooling=COP_COOLING, eff_heating=EFF_HEATING,
+        )
+
+        if df_resultados is None or df_resultados.empty:
+            print("ERROR: No se obtuvieron resultados.")
+        else:
+            # CSV para Streamlit
+            csv_path = "/content/resultados_sfr_curva.csv"
+            df_resultados.to_csv(csv_path, index=False)
+
+            # Resumen ejecutivo
+            idx_opt  = df_resultados["ahorro_neto_kwh"].idxmax()
+            fila_opt = df_resultados.iloc[idx_opt]
+
+            print("\n" + "=" * 60)
+            print("RESUMEN EJECUTIVO")
+            print("=" * 60)
+            print(f"SFR OPTIMO          : {fila_opt['sfr_pct']:.0f}%")
+            print(f"DOMOS RECOMENDADOS  : {int(fila_opt['num_domos'])} unidades")
+            print(f"Ahorro Iluminacion  : {fila_opt['ahorro_luz_kwh']:,.0f} kWh/anio")
+            print(f"Penalizacion AC     : {fila_opt['penalizacion_cool_kwh']:,.0f} kWh/anio")
+            print(f"Ahorro Calefaccion  : {fila_opt['ahorro_heat_kwh']:,.0f} kWh/anio")
+            print(f"AHORRO NETO TOTAL   : {fila_opt['ahorro_neto_kwh']:,.0f} kWh/anio")
+            print("=" * 60)
+            print(f"CSV guardado en     : {csv_path}")
+            print("")
+
+            # Graficas
+            print("Generando graficas...")
+            graficar_curva_optimizacion(df_resultados)
+            graficar_tabla_resultados(df_resultados)
+
+            # Tabla texto
+            print("\nTABLA COMPLETA:")
+            print(df_resultados[[
+                "sfr_pct", "num_domos",
+                "ahorro_luz_kwh", "penalizacion_cool_kwh",
+                "ahorro_heat_kwh", "ahorro_neto_kwh"
+            ]].to_string(index=False))
+
+            print("\n" + "=" * 60)
+            print("CELDA 10 OK - SIMULACION COMPLETADA.")
+            print("=" * 60)
+
+    except Exception as _e10:
+        import traceback
+        print(f"\nERROR EN SIMULACION: {_e10}")
+        print("-" * 60)
+        traceback.print_exc()
+        print("-" * 60)
+        print("Diagnostico:")
+        print("  1. EnergyPlus no disponible? -> re-ejecutar celda 1 + Restart")
+        print("  2. EPW no descargado?        -> re-ejecutar celda 4")
+        print("  3. honeybee-energy fallo?    -> ver traceback arriba")
